@@ -28,6 +28,10 @@ function loadState() {
       if (!Number.isInteger(merged.next_log_id)) merged.next_log_id = 1;
       if (!Number.isInteger(merged.next_line_id)) merged.next_line_id = 1;
       if (!Number.isInteger(merged.next_event_id)) merged.next_event_id = 1;
+      if (!Number.isInteger(merged.next_batch_id)) merged.next_batch_id = 1;
+      if (!Number.isInteger(merged.next_disposal_id)) merged.next_disposal_id = 1;
+      if (!Array.isArray(merged.batches)) merged.batches = [];
+      if (!Array.isArray(merged.disposals)) merged.disposals = [];
       /* 旧成员档案补全分餐协作字段 */
       for (const m of merged.members || []) {
         if (!Array.isArray(m.exclude)) m.exclude = [];
@@ -115,6 +119,8 @@ const server = http.createServer(async (req, res) => {
         nutrient_labels: foodsMod.NUTRIENT_LABEL,
         nutrient_order: foodsMod.NUTRIENT_ORDER,
         member_roles: household.MEMBER_ROLES,
+        shelf_days: foodsMod.SHELF_DAYS,
+        near_expiry_days: household.NEAR_EXPIRY_DAYS,
       });
     }
     if (p === "/api/foods" && req.method === "GET") {
@@ -237,7 +243,23 @@ const server = http.createServer(async (req, res) => {
     }
     if (p === "/api/household/stock" && req.method === "POST") {
       const body = JSON.parse(await readBody(req));
-      household.setManualStock(state, body.food_id, body.grams);
+      household.setManualStock(state, body.food_id, body.grams, body);
+      return json(res, 200, hh());
+    }
+    /* 食材批次与保质期：采购负责人登记批次；家长审核临期 / 确认报废（报废同步库存、预算与替换采购） */
+    if (p === "/api/household/batches" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      household.registerBatch(state, body, body.actor_id);
+      return json(res, 200, hh());
+    }
+    if ((mm = p.match(/^\/api\/household\/batches\/(\d+)\/review$/)) && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      household.reviewBatch(state, Number(mm[1]), body.actor_id);
+      return json(res, 200, hh());
+    }
+    if ((mm = p.match(/^\/api\/household\/batches\/(\d+)\/dispose$/)) && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      household.disposeBatch(state, Number(mm[1]), body);
       return json(res, 200, hh());
     }
     if (p === "/api/household/cycle" && req.method === "POST") {

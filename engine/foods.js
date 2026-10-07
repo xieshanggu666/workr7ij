@@ -86,6 +86,10 @@ const CATEGORY_LABEL = {
 
 const ALLERGENS = ["麸质", "蛋", "乳", "大豆", "花生", "坚果", "鱼", "虾", "贝类", "芝麻"];
 
+/* 各类食材默认保质天数（冷藏 / 常温家庭储存近似值）：到货或登记批次未指定
+   「保质期至」时，按 生产日期（缺省为登记当日）+ 该类默认天数 推算批次保质期。 */
+const SHELF_DAYS = { staple: 7, meat: 2, dairy: 4, veg: 3, fruit: 5, nut: 60 };
+
 const NUTRIENT_UNIT = {
   kcal: "kcal", protein: "g", fat: "g", carb: "g", fiber: "g",
   sodium: "mg", potassium: "mg", calcium: "mg", iron: "mg",
@@ -125,6 +129,6 @@ function costFor(food, grossWeightGrams) {
 }
 
 module.exports = {
-  FOODS, CATEGORY_LABEL, ALLERGENS, NUTRIENT_UNIT, NUTRIENT_LABEL, NUTRIENT_ORDER,
+  FOODS, CATEGORY_LABEL, ALLERGENS, SHELF_DAYS, NUTRIENT_UNIT, NUTRIENT_LABEL, NUTRIENT_ORDER,
   getFood, listFoods, nutrientsFor, costFor,
 };

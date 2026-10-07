@@ -88,10 +88,10 @@ function familyNeed(state, fp0) {
   return need;
 }
 
-/* 在库 + 待买能否覆盖分餐净需求（采购齐备口径），返回缺料明细；day_index 可只看某日 */
+/* 在库 + 待买能否覆盖分餐净需求（采购齐备口径，在库按可用库存即剔除失效批次），返回缺料明细；day_index 可只看某日 */
 function familyDeficits(state, fp0, dayIndex) {
   const fp = fp0 || state.family_plan;
-  const on = hh.stockOnHand(state);
+  const on = hh.usableStock(state);
   const pendingGrams = {};
   for (const it of state.shopping) {
     if (it.cycle === state.cycle_no && it.status === "pending") {
@@ -114,10 +114,10 @@ function familyDeficits(state, fp0, dayIndex) {
   return deficits;
 }
 
-/* 库存实际可扣（不含待买）口径：按日消耗前校验 */
+/* 库存实际可扣（可用库存，不含待买与已失效批次）口径：按日消耗前校验 */
 function familyStockDeficits(state, dayIndex) {
   const fp = state.family_plan;
-  const on = hh.stockOnHand(state);
+  const on = hh.usableStock(state);
   const need = {};
   for (const ln of fp.lines) {
     if (ln.status === "dropped") continue;
@@ -338,7 +338,7 @@ function substituteOptions(state, lineId, actorId) {
     if (other.member_id === ln.member_id && other.day === ln.day && other.id !== ln.id && other.status !== "dropped") exclude.add(other.food_id);
   }
   const used = plannedWeeklyUsed(state);
-  const on = hh.stockOnHand(state);
+  const on = hh.usableStock(state);
   const cur = getFood(ln.food_id);
   const options = slot.pool.map(getFood).filter(Boolean).filter(f => f.id !== ln.food_id)
     .filter(f => !f.allergens.some(a => avoid.has(a)))
@@ -358,7 +358,7 @@ function replanMemberDay(state, member, dayIndex, forced) {
     exclude: member.exclude || [],
     weekly_used: plannedWeeklyUsed(state),
     day_pools: dayPools,
-    stock: hh.stockOnHand(state),
+    stock: hh.usableStock(state),
   });
 }
 

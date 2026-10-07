@@ -370,6 +370,18 @@
         </div>
         <div id="hh_stock_table"></div>
       </div>
+
+      <div class="hh-section">
+        <h3>🧊 食材批次与保质期 <span class="count" id="hh_batch_sub"></span></h3>
+        <div class="hh-toolbar">
+          <button class="btn" id="hh_add_batch">＋ 登记批次（采购负责人）</button>
+          <span style="font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px">操作身份
+            <select class="mini" id="hh_batch_actor" style="padding:5px 8px"></select>
+          </span>
+        </div>
+        <div id="hh_batch_table"></div>
+        <div id="hh_disposal_list" style="margin-top:10px"></div>
+      </div>
     </div>
   </main>
 </div>
@@ -379,13 +391,14 @@
 "use strict";
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
-const meta = { profiles: {}, activities: {}, goals: {}, allergens: [], nutrient_labels: {}, nutrient_order: [], member_roles: {} };
+const meta = { profiles: {}, activities: {}, goals: {}, allergens: [], nutrient_labels: {}, nutrient_order: [], member_roles: {}, shelf_days: {}, near_expiry_days: 2 };
 const state = { mode: "day", plan: null, week: null, params: null, household: null, actorId: null, famFilter: { member: "", day: -1, meal: "" } };
 
 function initMeta(m) {
   meta.profiles = m.profiles; meta.activities = m.activities; meta.goals = m.goals;
   meta.allergens = m.allergens; meta.nutrient_labels = m.nutrient_labels;
   meta.nutrient_order = m.nutrient_order; meta.member_roles = m.member_roles || {};
+  meta.shelf_days = m.shelf_days || {}; meta.near_expiry_days = m.near_expiry_days != null ? m.near_expiry_days : 2;
   const sel = (id, map) => {
     const el = $(id);
     el.innerHTML = Object.entries(map).map(([k, v]) => `<option value="${k}">${v}</option>`).join("");
@@ -645,6 +658,7 @@ function renderHousehold() {
   renderShopping(h);
   renderDays(h);
   renderStock(h);
+  renderBatches(h);
 }
 
 function renderWarnings(h) {
@@ -666,7 +680,9 @@ function renderBudget(h) {
     <div class="b-card"><div class="k">待买预估占用</div><div class="v">¥${b.committed.toFixed(1)}</div></div>
     <div class="b-card"><div class="k">预计本周总支出</div><div class="v ${b.over ? "bad" : "good"}">¥${b.projected.toFixed(1)}</div></div>
     <div class="b-card"><div class="k">预算余额</div><div class="v ${b.remaining < 0 ? "bad" : "good"}">${b.remaining < 0 ? "-" : ""}¥${Math.abs(b.remaining).toFixed(1)}</div></div>
-    <div class="b-card"><div class="k">库存估值</div><div class="v">¥${h.inventory_value.toFixed(1)}</div></div>`;
+    <div class="b-card"><div class="k">库存估值</div><div class="v">¥${h.inventory_value.toFixed(1)}</div></div>
+    <div class="b-card"><div class="k">本周报废损失</div><div class="v ${b.waste_loss > 0 ? "bad" : ""}">¥${(b.waste_loss || 0).toFixed(1)}</div>
+      <div style="font-size:11px;color:#6b7d70">${(b.waste_grams || 0) > 0 ? `报废 ${b.waste_grams}g` : "无报废批次"}</div></div>`;
 }
 
 function renderMembers(h) {
@@ -759,12 +775,114 @@ function renderStock(h) {
     ? `· ${h.stock.length} 种食材在库 · 估值 ¥${h.inventory_value.toFixed(1)}`
     : "· 当前无库存";
   $("#hh_stock_table").innerHTML = h.stock.length ? `<table class="hh-table">
-    <tr><th>食材</th><th>在库（毛重）</th><th>估值</th><th>提示</th></tr>
+    <tr><th>食材</th><th>在库（毛重）</th><th>可用于配餐</th><th>估值</th><th>提示</th></tr>
     ${h.stock.map(s => `<tr style="${s.allergen_flag ? "background:#fff7f6" : ""}">
-      <td>${esc(s.name)}</td><td>${s.grams}g</td><td>¥${s.value.toFixed(2)}</td>
-      <td>${s.allergen_flag ? `<span class="mini-tag">含全家规避过敏原：${s.allergens.filter(a => h.family_allergens.includes(a)).join("、")}</span>` : '<span class="mini-tag ok">可用于配餐</span>'}</td>
+      <td>${esc(s.name)}</td><td>${s.grams}g</td>
+      <td>${s.usable_grams}g${s.expired_grams > 0 ? ` <span class="mini-tag">已失效 ${s.expired_grams}g</span>` : ""}</td>
+      <td>¥${s.value.toFixed(2)}</td>
+      <td>${s.allergen_flag ? `<span class="mini-tag">含全家规避过敏原：${s.allergens.filter(a => h.family_allergens.includes(a)).join("、")}</span>` : s.expired_grams > 0 ? `<span class="mini-tag">部分批次已过期，配餐自动避开</span>` : '<span class="mini-tag ok">可用于配餐</span>'}</td>
     </tr>`).join("")}
   </table>` : `<div style="font-size:13px;color:#6b7d70">确认采购到货或录入期初库存后，这里会显示每种食材余量与估值。</div>`;
+}
+
+/* ---------- 食材批次与保质期 ---------- */
+
+function fmtDate(d) { return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0"); }
+function todayLocal() { return fmtDate(new Date()); }
+function defaultExpiryFor(foodId) {
+  const f = (state.foods || []).find(x => x.id === foodId);
+  const days = f && meta.shelf_days ? meta.shelf_days[f.cat] : null;
+  if (!days) return "";
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return fmtDate(d);
+}
+
+function batchStatusPill(b) {
+  if (b.freshness === "expired") return `<span class="mini-tag">已过期${b.days_left != null ? ` ${-b.days_left}天` : ""}</span>`;
+  if (b.freshness === "near") return `<span class="mini-tag" style="background:#fdf3e3;color:#a86a1c;border-color:#f0d8ae">临期 ${b.days_left}天</span>`;
+  if (b.freshness === "fresh") return `<span class="mini-tag ok">正常${b.days_left != null ? ` ${b.days_left}天` : ""}</span>`;
+  if (b.freshness === "depleted") return `<span class="mini-tag ok" style="background:#f0f3ef;color:var(--muted);border-color:var(--line)">已用完</span>`;
+  return `<span class="mini-tag ok" style="background:#f0f3ef;color:var(--muted);border-color:var(--line)">已报废</span>`;
+}
+
+function renderBatches(h) {
+  const batches = h.batches || [];
+  const live = batches.filter(b => b.freshness !== "disposed" && b.freshness !== "depleted");
+  const nearN = live.filter(b => b.freshness === "near").length;
+  const expN = live.filter(b => b.freshness === "expired").length;
+  $("#hh_batch_sub").textContent = live.length
+    ? `· ${live.length} 个在管批次${expN ? ` · ${expN} 批已过期待报废` : ""}${nearN ? ` · ${nearN} 批临期` : ""}`
+    : "· 到货自动登记批次，也可手动补登";
+  /* 操作身份（与分餐页共用） */
+  $("#hh_batch_actor").innerHTML = [`<option value="">系统（不校验角色）</option>`]
+    .concat(h.state.members.map(m => `<option value="${m.id}" ${state.actorId === m.id ? "selected" : ""}>${esc(m.name)}${m.role ? " · " + (meta.member_roles[m.role] || m.role) : ""}</option>`)).join("");
+  $("#hh_batch_actor").onchange = e => { state.actorId = e.target.value ? Number(e.target.value) : null; };
+
+  $("#hh_batch_table").innerHTML = batches.length ? `<table class="hh-table">
+    <tr><th>状态</th><th>食材 / 批次</th><th>剩余 / 登记</th><th>生产日期</th><th>保质期至</th><th>来源</th><th>操作（家长）</th></tr>
+    ${batches.map(b => `<tr style="${b.freshness === "expired" ? "background:#fff7f6" : b.freshness === "near" ? "background:#fffcf4" : ""}">
+      <td>${batchStatusPill(b)}</td>
+      <td>${esc(b.name)} <span style="color:var(--muted);font-size:11px">#${b.id}</span></td>
+      <td>${b.remaining}g / ${b.grams}g</td>
+      <td>${b.produced_on || "—"}</td>
+      <td>${b.expiry_on || "长期"}</td>
+      <td>${b.source_label}${b.registered_by_name ? " · " + esc(b.registered_by_name) : ""}${b.reviewed_by_name ? `<br><span class="mini-tag ok">家长${esc(b.reviewed_by_name)}已审核</span>` : ""}</td>
+      <td>${b.freshness === "near" && !b.reviewed_ts ? `<button class="icon-btn" data-batch-review="${b.id}">审核留用</button> ` : ""}${["fresh", "near", "expired"].includes(b.freshness) ? `<button class="icon-btn danger" data-batch-dispose="${b.id}">报废</button>` : ""}</td>
+    </tr>`).join("")}
+  </table>` : `<div style="font-size:13px;color:#6b7d70">采购到货会自动生成批次（按类目默认保质天数推算保质期）；冰箱现有食材可点「登记批次」补登。临期与过期批次会在上方预警中提示，过期食材配餐自动避开。</div>`;
+  $$("[data-batch-review]").forEach(btn => btn.onclick = () => hhCall(`/api/household/batches/${btn.dataset.batchReview}/review`, { actor_id: state.actorId }));
+  $$("[data-batch-dispose]").forEach(btn => btn.onclick = () => disposeModal(batches.find(x => x.id === Number(btn.dataset.batchDispose))));
+
+  const ds = (h.disposals || []).slice(0, 10);
+  $("#hh_disposal_list").innerHTML = ds.length ? `
+    <div style="font-size:12.5px;font-weight:700;margin-bottom:6px">最近报废记录（已同步扣库存、计损失并生成替换采购）</div>
+    ${ds.map(d => `<div class="trace-item">🗑️ ${esc(d.name)} ${d.grams}g · 损失 ¥${d.value_loss.toFixed(2)} · ${esc(d.reason)}${d.by_name ? ` · ${esc(d.by_name)}` : ""}
+      <div class="ev">${new Date(d.ts).toLocaleString()}</div></div>`).join("")}` : "";
+}
+
+function batchModal() {
+  const h = state.household;
+  const root = modal(`
+    <h3>登记食材批次（采购负责人）</h3>
+    <div class="field"><label>食材（针对已在库但未批次的库存补登保质期）</label><select id="bt_food" style="width:100%;padding:8px 10px">${foodSelect()}</select></div>
+    <div class="field"><label>批次克重（毛重 g）<span id="bt_avail" style="color:var(--muted);font-weight:400"></span></label><input id="bt_grams" type="number" min="10" step="10" value="200" style="width:100%;padding:8px 10px"></div>
+    <div class="field"><label>生产日期（可选）</label><input id="bt_produced" type="date" style="width:100%;padding:8px 10px"></div>
+    <div class="field"><label>保质期至（留空按类目默认保质天数推算）</label><input id="bt_expiry" type="date" style="width:100%;padding:8px 10px"></div>
+    <div class="ops"><button class="btn cancel" data-close>取消</button><button class="btn" id="bt_save">登记批次</button></div>`);
+  const foodSel = root.querySelector("#bt_food");
+  const refresh = () => {
+    const fid = foodSel.value;
+    const s = (h.stock || []).find(x => x.food_id === fid);
+    const batched = (h.batches || []).filter(b => b.food_id === fid && b.freshness !== "disposed").reduce((sum, b) => sum + b.remaining, 0);
+    const avail = Math.max(0, Math.round(((s ? s.grams : 0) - batched) * 10) / 10);
+    root.querySelector("#bt_avail").textContent = `（可登记 ${avail}g）`;
+    root.querySelector("#bt_expiry").value = defaultExpiryFor(fid);
+  };
+  foodSel.onchange = refresh;
+  refresh();
+  root.querySelector("#bt_save").onclick = async () => {
+    const body = {
+      food_id: foodSel.value,
+      grams: Number(root.querySelector("#bt_grams").value),
+      actor_id: state.actorId,
+    };
+    if (root.querySelector("#bt_produced").value) body.produced_on = root.querySelector("#bt_produced").value;
+    if (root.querySelector("#bt_expiry").value) body.expiry_on = root.querySelector("#bt_expiry").value;
+    if (await hhCall("/api/household/batches", body)) closeModal();
+  };
+}
+
+function disposeModal(b) {
+  if (!b) return;
+  const root = modal(`
+    <h3>家长确认报废：${esc(b.name)} 批次#${b.id}</h3>
+    <div style="font-size:13px;margin-bottom:10px">剩余 <b>${b.remaining}g</b>（${b.expiry_on ? `保质期至 ${b.expiry_on}` : "未登记保质期"}），预计损失 <b>¥${b.value.toFixed(2)}</b>。报废后将同步扣减库存、计入本周报废损失，并自动生成替换采购项（如无需补货可在采购清单中删除）。</div>
+    <div class="field"><label>报废原因</label><input id="dp_reason" class="mini" value="${b.freshness === "expired" ? "过期报废" : "变质报废"}" style="width:100%;padding:8px 10px"></div>
+    <div class="ops"><button class="btn cancel" data-close>取消</button><button class="btn warn" id="dp_save">确认报废并补货</button></div>`);
+  root.querySelector("#dp_save").onclick = async () => {
+    if (await hhCall(`/api/household/batches/${b.id}/dispose`, { reason: root.querySelector("#dp_reason").value, actor_id: state.actorId })) closeModal();
+  };
 }
 
 /* ---------- 弹窗 ---------- */
@@ -820,11 +938,15 @@ function arriveModal(it) {
     <h3>确认到货：${esc(it.name)}</h3>
     <div class="field"><label>实际克重（毛重 g）</label><input class="mini" id="a_grams" type="number" min="1" value="${it.grams}" style="width:100%;padding:8px 10px"></div>
     <div class="field"><label>实际单价（元 / 100g，留空按预估 ¥${state.foods.find(f => f.id === it.food_id).cost}）</label><input class="mini" id="a_cost" type="number" min="0" step="0.1" placeholder="按预估单价" style="width:100%;padding:8px 10px"></div>
-    <div class="ops"><button class="btn cancel" data-close>取消</button><button class="btn" id="a_save">确认入库</button></div>`);
+    <div class="field"><label>生产日期（可选，登记批次）</label><input id="a_produced" type="date" style="width:100%;padding:8px 10px"></div>
+    <div class="field"><label>保质期至（默认按类目保质天数推算，可改）</label><input id="a_expiry" type="date" value="${defaultExpiryFor(it.food_id)}" style="width:100%;padding:8px 10px"></div>
+    <div class="ops"><button class="btn cancel" data-close>取消</button><button class="btn" id="a_save">确认入库并登记批次</button></div>`);
   root.querySelector("#a_save").onclick = async () => {
     const body = { grams: Number(root.querySelector("#a_grams").value) };
     const uc = root.querySelector("#a_cost").value;
     if (uc !== "") body.unit_cost = Number(uc);
+    if (root.querySelector("#a_produced").value) body.produced_on = root.querySelector("#a_produced").value;
+    if (root.querySelector("#a_expiry").value) body.expiry_on = root.querySelector("#a_expiry").value;
     if (await hhCall(`/api/household/shopping/${it.id}/arrive`, body)) closeModal();
   };
 }
@@ -851,10 +973,16 @@ function stockModal() {
     <h3>期初 / 盘库录入</h3>
     <div class="field"><label>食材</label><select id="s_food" style="width:100%;padding:8px 10px">${foodSelect()}</select></div>
     <div class="field"><label>在库克重（毛重 g，填 0 清除）</label><input id="s_grams" type="number" min="0" step="10" value="0" style="width:100%;padding:8px 10px"></div>
+    <div class="field"><label>保质期至（可选，仅盘库增量时同步登记批次）</label><input id="s_expiry" type="date" style="width:100%;padding:8px 10px"></div>
     <div style="font-size:11px;color:#6b7d70;line-height:1.6">用于录入采购渠道外的期初库存或盘点修正。若食材含全家规避过敏原，会在预警中提示但不拦截（防止误用）。</div>
     <div class="ops"><button class="btn cancel" data-close>取消</button><button class="btn" id="s_save">保存库存</button></div>`);
+  const foodSel = root.querySelector("#s_food");
+  foodSel.onchange = () => { root.querySelector("#s_expiry").value = defaultExpiryFor(foodSel.value); };
+  foodSel.onchange();
   root.querySelector("#s_save").onclick = async () => {
-    if (await hhCall("/api/household/stock", { food_id: root.querySelector("#s_food").value, grams: Number(root.querySelector("#s_grams").value) })) closeModal();
+    const body = { food_id: foodSel.value, grams: Number(root.querySelector("#s_grams").value) };
+    if (root.querySelector("#s_expiry").value) body.expiry_on = root.querySelector("#s_expiry").value;
+    if (await hhCall("/api/household/stock", body)) closeModal();
   };
 }
 
@@ -883,6 +1011,7 @@ async function buildShoppingFromWeek() {
 $("#hh_add_member").onclick = () => memberModal(null);
 $("#hh_add_item").onclick = () => addItemModal();
 $("#hh_add_stock").onclick = () => stockModal();
+$("#hh_add_batch").onclick = () => batchModal();
 $("#hh_edit_budget").onclick = () => budgetModal();
 $("#hh_build").onclick = buildShoppingFromWeek;
 $("#hh_new_cycle").onclick = async () => {
@@ -1119,11 +1248,15 @@ function famArriveModal(f, it) {
     <h3>采购负责人确认到货：${esc(it.name)}</h3>
     <div class="field"><label>实际克重（毛重 g）</label><input id="fa_grams" type="number" min="1" value="${it.grams}" style="width:100%;padding:8px 10px"></div>
     <div class="field"><label>实际单价（元/100g，留空按预估 ¥${state.foods.find(x => x.id === it.food_id).cost}）</label><input id="fa_cost" type="number" min="0" step="0.1" style="width:100%;padding:8px 10px"></div>
-    <div class="ops"><button class="btn cancel" data-close>取消</button><button class="btn" id="fa_save">验收入库</button></div>`);
+    <div class="field"><label>生产日期（可选，登记批次）</label><input id="fa_produced" type="date" style="width:100%;padding:8px 10px"></div>
+    <div class="field"><label>保质期至（默认按类目保质天数推算，可改）</label><input id="fa_expiry" type="date" value="${defaultExpiryFor(it.food_id)}" style="width:100%;padding:8px 10px"></div>
+    <div class="ops"><button class="btn cancel" data-close>取消</button><button class="btn" id="fa_save">验收入库并登记批次</button></div>`);
   root.querySelector("#fa_save").onclick = async () => {
     const body = { grams: Number(root.querySelector("#fa_grams").value) };
     const uc = root.querySelector("#fa_cost").value;
     if (uc !== "") body.unit_cost = Number(uc);
+    if (root.querySelector("#fa_produced").value) body.produced_on = root.querySelector("#fa_produced").value;
+    if (root.querySelector("#fa_expiry").value) body.expiry_on = root.querySelector("#fa_expiry").value;
     if (await famCall(`/api/family/shopping/${it.id}/arrive`, body)) closeModal();
   };
 }
