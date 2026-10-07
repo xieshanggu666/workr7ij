@@ -88,10 +88,11 @@ function familyNeed(state, fp0) {
   return need;
 }
 
-/* 在库 + 待买能否覆盖分餐净需求（采购齐备口径），返回缺料明细；day_index 可只看某日 */
+/* 在库 + 待买能否覆盖分餐净需求（采购齐备口径），返回缺料明细；day_index 可只看某日。
+   在库只计未过期 / 未报废批次：失效食材成员配餐自动避开，缺口进入替换采购。 */
 function familyDeficits(state, fp0, dayIndex) {
   const fp = fp0 || state.family_plan;
-  const on = hh.stockOnHand(state);
+  const on = hh.usableStock(state);
   const pendingGrams = {};
   for (const it of state.shopping) {
     if (it.cycle === state.cycle_no && it.status === "pending") {
@@ -114,10 +115,10 @@ function familyDeficits(state, fp0, dayIndex) {
   return deficits;
 }
 
-/* 库存实际可扣（不含待买）口径：按日消耗前校验 */
+/* 库存实际可扣（不含待买，且剔除失效批次）口径：按日消耗前校验 */
 function familyStockDeficits(state, dayIndex) {
   const fp = state.family_plan;
-  const on = hh.stockOnHand(state);
+  const on = hh.usableStock(state);
   const need = {};
   for (const ln of fp.lines) {
     if (ln.status === "dropped") continue;
@@ -128,7 +129,8 @@ function familyStockDeficits(state, dayIndex) {
   for (const [id, g] of Object.entries(need)) {
     if ((on[id] || 0) + 1e-6 < g) {
       const f = getFood(id);
-      deficits.push({ food_id: id, name: f ? f.name : id, have: on[id] || 0, need: round1(g), short: round1(g - (on[id] || 0)) });
+      const physical = hh.stockOnHand(state)[id] || 0;
+      deficits.push({ food_id: id, name: f ? f.name : id, have: on[id] || 0, physical, need: round1(g), short: round1(g - (on[id] || 0)) });
     }
   }
   return deficits;
@@ -338,7 +340,7 @@ function substituteOptions(state, lineId, actorId) {
     if (other.member_id === ln.member_id && other.day === ln.day && other.id !== ln.id && other.status !== "dropped") exclude.add(other.food_id);
   }
   const used = plannedWeeklyUsed(state);
-  const on = hh.stockOnHand(state);
+  const on = hh.usableStock(state);
   const cur = getFood(ln.food_id);
   const options = slot.pool.map(getFood).filter(Boolean).filter(f => f.id !== ln.food_id)
     .filter(f => !f.allergens.some(a => avoid.has(a)))
@@ -358,7 +360,7 @@ function replanMemberDay(state, member, dayIndex, forced) {
     exclude: member.exclude || [],
     weekly_used: plannedWeeklyUsed(state),
     day_pools: dayPools,
-    stock: hh.stockOnHand(state),
+    stock: hh.usableStock(state),
   });
 }
 
@@ -423,8 +425,12 @@ function arriveFamilyItem(state, itemId, opts, actorId) {
   assertRole(state, actorId, "buyer");
   const it = state.shopping.find(x => x.id === Number(itemId) && x.cycle === state.cycle_no);
   if (!it) throw new Error("采购任务不存在");
-  const arrived = hh.arriveItem(state, it.id, Object.assign({}, opts, { arrived_by: actorId == null ? undefined : Number(actorId) }));
-  state.family_plan.events.push({ id: state.next_event_id++, ts: nowStamp(), kind: "arrive", by: actorId == null ? null : Number(actorId), shopping_id: it.id, food_id: it.food_id, grams: arrived.arrived_grams, actual_cost: arrived.actual_cost });
+  const arrived = hh.arriveItem(
+    state, it.id,
+    Object.assign({}, opts, { arrived_by: actorId == null ? undefined : Number(actorId) }),
+    actorId,
+  );
+  state.family_plan.events.push({ id: state.next_event_id++, ts: nowStamp(), kind: "arrive", by: actorId == null ? null : Number(actorId), shopping_id: it.id, food_id: it.food_id, grams: arrived.arrived_grams, actual_cost: arrived.actual_cost, expire_date: opts.expire_date || null });
   return familyView(state);
 }
 
@@ -626,10 +632,13 @@ function familyView(state) {
   };
 }
 
+/* 注入 household 的库存变化重算钩子：家长报废批次后，分餐采购净需求自动补替换采购 */
+hh.setFamilyResyncHook((state) => resyncFamilyShopping(state));
+
 module.exports = {
   buildFamilyPlan, setLineGrams, confirmPortions,
   substituteOptions, substituteLine,
   arriveFamilyItem, consumeFamilyDay, familyDayReady,
   familyView, familyTrace, familyCurrent, familyNeed, familyDeficits, familyStockDeficits,
-  plannedWeeklyUsed, memberDayNutrition,
+  plannedWeeklyUsed, memberDayNutrition, resyncFamilyShopping,
 };

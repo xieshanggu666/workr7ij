@@ -28,11 +28,20 @@ function loadState() {
       if (!Number.isInteger(merged.next_log_id)) merged.next_log_id = 1;
       if (!Number.isInteger(merged.next_line_id)) merged.next_line_id = 1;
       if (!Number.isInteger(merged.next_event_id)) merged.next_event_id = 1;
+      if (!Number.isInteger(merged.next_batch_id)) merged.next_batch_id = 1;
+      if (!Number.isInteger(merged.next_scrap_id)) merged.next_scrap_id = 1;
+      if (!Number.isInteger(merged.next_batch_event_id)) merged.next_batch_event_id = 1;
+      if (!Array.isArray(merged.batches)) merged.batches = [];
+      if (!Array.isArray(merged.scraps)) merged.scraps = [];
+      if (!Array.isArray(merged.batch_events)) merged.batch_events = [];
+      if (!("near_days" in merged) || !Number.isInteger(merged.near_days)) merged.near_days = household.batches.DEFAULT_NEAR_DAYS;
       /* 旧成员档案补全分餐协作字段 */
       for (const m of merged.members || []) {
         if (!Array.isArray(m.exclude)) m.exclude = [];
         if (!("role" in m)) m.role = null;
       }
+      /* 批次台账上线前的历史库存迁移（stock_manual / arrived / consumption -> 批次） */
+      household.batches.migrateBatches(merged);
       return merged;
     }
   } catch (e) {
@@ -218,7 +227,10 @@ const server = http.createServer(async (req, res) => {
     }
     if ((mm = p.match(/^\/api\/household\/shopping\/(\d+)\/arrive$/)) && req.method === "POST") {
       const body = JSON.parse(await readBody(req));
-      household.arriveItem(state, Number(mm[1]), body);
+      const actorId = body.actor_id;
+      delete body.actor_id;
+      /* 采购负责人登记到货批次（生产日期 / 保质期 / 到期日可选，缺省长期有效） */
+      household.arriveItem(state, Number(mm[1]), body, actorId == null ? undefined : Number(actorId));
       return json(res, 200, hh());
     }
     if ((mm = p.match(/^\/api\/household\/shopping\/(\d+)$/)) && req.method === "DELETE") {
@@ -237,7 +249,41 @@ const server = http.createServer(async (req, res) => {
     }
     if (p === "/api/household/stock" && req.method === "POST") {
       const body = JSON.parse(await readBody(req));
-      household.setManualStock(state, body.food_id, body.grams);
+      const actorId = body.actor_id;
+      delete body.actor_id;
+      /* 盘库录入同时可登记保质期，登记为一条 stocktake 批次 */
+      household.setManualStock(state, body.food_id, body.grams, {
+        produced_date: body.produced_date, shelf_days: body.shelf_days, expire_date: body.expire_date,
+      }, actorId == null ? undefined : Number(actorId));
+      return json(res, 200, hh());
+    }
+    /* 业务日期（保质期判定基准）与临期阈值；{today:"YYYY-MM-DD"|null, near_days} */
+    if (p === "/api/household/clock" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      household.setClock(state, body.today == null ? null : body.today, body.near_days);
+      return json(res, 200, hh());
+    }
+    /* 采购负责人直接登记食材批次（采购渠道外入库 / 补登保质期） */
+    if (p === "/api/household/batches" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      const actorId = body.actor_id;
+      delete body.actor_id;
+      household.registerStockBatch(state, body, actorId == null ? undefined : Number(actorId));
+      return json(res, 200, hh());
+    }
+    let bm;
+    /* 家长审核临期：确认继续使用（不再临期预警，过期仍自动失效） */
+    if ((bm = p.match(/^\/api\/household\/batches\/(\d+)\/keep$/)) && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      household.keepBatch(state, Number(bm[1]), body.actor_id == null ? undefined : Number(body.actor_id), body.note);
+      return json(res, 200, hh());
+    }
+    /* 家长审核报废（可部分报废）：扣库存 / 估值，记本周损失，自动补替换采购并同步预算 */
+    if ((bm = p.match(/^\/api\/household\/batches\/(\d+)\/scrap$/)) && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      const actorId = body.actor_id;
+      delete body.actor_id;
+      household.reviewScrapBatch(state, Number(bm[1]), body, actorId == null ? undefined : Number(actorId));
       return json(res, 200, hh());
     }
     if (p === "/api/household/cycle" && req.method === "POST") {

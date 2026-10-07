@@ -11,6 +11,7 @@
 
 const { getFood, costFor, ALLERGENS } = require("./foods");
 const { PROFILE_KEYS, ACTIVITY_KEYS, GOAL_KEYS } = require("./requirements");
+const batchesMod = require("./batches");
 
 const ROUND_G = 10;        // 采购克重取整步长
 const SAFETY_FACTOR = 1.1; // 采购安全余量
@@ -28,11 +29,16 @@ function emptyHousehold() {
     version: 1,
     cycle_no: 1,            // 采购周期（周）序号，新周期库存结转、限次计数清零
     weekly_budget: 175,
+    today: null,            // 业务日期（YYYY-MM-DD），null=跟随系统当天；保质期判定基准
+    near_days: batchesMod.DEFAULT_NEAR_DAYS, // 临期预警阈值（剩余天数）
     members: [],
     next_member_id: 1,
     shopping: [],           // {id, cycle, source:"menu"|"manual"|"family", food_id, grams, est_cost, assignee, status, arrived_grams, actual_cost, arrived_by}
-    consumption: [],        // {id, cycle, food_id, grams, source:"plan"|"manual", day_index, member}
-    stock_manual: {},       // 期初 / 盘库入库（非采购渠道）{food_id: grams}
+    consumption: [],        // {id, cycle, food_id, grams, source:"plan"|"manual", day_index, member, allocations:[{batch_id, grams}]}
+    stock_manual: {},       // 期初 / 盘库（迁移兼容字段；新入库走批次台账 batches）
+    batches: [],            // 食材批次台账 {id, cycle, source, shopping_id, food_id, grams, consumed_grams, scrapped_grams, unit_cost, produced_date, expire_date, shelf_days, near_acked, status, ...}
+    scraps: [],             // 报废记录 {id, cycle, batch_id, food_id, grams, unit_cost, cost, reason_status, reason, by, ts}
+    batch_events: [],       // 批次事件流（登记 / 临期确认 / 报废），批次维度可追溯
     consumed_days: [],      // 当前周期已按配餐消耗的日序号
     week: null,             // 最近一次联动生成的周菜单 {cycle, params, plan}，cycle 为菜单所属采购周
     family_plan: null,      // 家庭分餐协作菜单（按成员营养目标生成，行级份量 / 替换 / 到货 / 消耗可追溯）
@@ -40,6 +46,9 @@ function emptyHousehold() {
     next_log_id: 1,
     next_line_id: 1,
     next_event_id: 1,
+    next_batch_id: 1,
+    next_scrap_id: 1,
+    next_batch_event_id: 1,
   };
 }
 
@@ -125,10 +134,16 @@ function removeMember(state, id) {
   for (const it of state.shopping) if (it.assignee === id) it.assignee = null;
 }
 
-/* ---------------- 库存核算 ---------------- */
+/* ---------------- 库存核算（批次台账口径） ---------------- */
 
-/* 在库库存（毛重克）= 历轮到货 + 期初盘库 - 全部消耗，截断为非负 */
+/* 物理在库（毛重克，含已过期但尚未报废的批次）= 各批次剩余之和。
+   未迁移的旧状态回退到旧公式（manual + 到货 - 消耗）。 */
 function stockOnHand(state) {
+  if (Array.isArray(state.batches)) {
+    const map = batchesMod.stockOnHandBatches(state);
+    for (const id of Object.keys(map)) map[id] = Math.max(0, round1(map[id]));
+    return map;
+  }
   const map = {};
   for (const [id, g] of Object.entries(state.stock_manual || {})) map[id] = (map[id] || 0) + Number(g) || 0;
   for (const it of state.shopping) {
@@ -139,8 +154,26 @@ function stockOnHand(state) {
   return map;
 }
 
-/* 库存估值：消耗优先抵减期初/盘库，剩余采购库存按实际加权均价计价 */
+/* 可用库存：剔除已过期 / 已报废批次——配餐库存优先、净采购抵扣、缺料 / 替换采购均以此为准。
+   临期批次仍可用（消耗时 FEFO 先到期优先），家长确认“继续使用”或报废前一直保留在可用口径。 */
+function usableStock(state, today) {
+  if (Array.isArray(state.batches)) return batchesMod.usableStockMap(state, today);
+  return stockOnHand(state);
+}
+
+/* 失效库存（过期未报废 + 已报废仍记账的物理余量），仅供预警 / 视图列示 */
+function unusableStock(state, today) {
+  if (Array.isArray(state.batches)) return batchesMod.unusableStockMap(state, today);
+  return {};
+}
+
+/* 库存估值：可配餐批次按批次实际单价计价，过期 / 报废批次单列 unusable_total。
+   未迁移旧状态沿用旧的加权口径，保证升级前后数值一致。 */
 function inventoryValue(state, onHand) {
+  if (Array.isArray(state.batches)) {
+    const v = batchesMod.inventoryValueByBatches(state);
+    return { total: v.total, per: v.per, usable_total: v.usable_total, unusable_total: v.unusable_total, unusable_per: v.unusable_per };
+  }
   const on = onHand || stockOnHand(state);
   const pur = {};
   for (const it of state.shopping) {
@@ -176,15 +209,20 @@ function budgetSummary(state) {
   const spent = round2(items.filter(i => i.status === "arrived").reduce((s, i) => s + (i.actual_cost || 0), 0));
   const estSpent = round2(items.filter(i => i.status === "arrived").reduce((s, i) => s + (i.est_cost || 0), 0));
   const committed = round2(items.filter(i => i.status === "pending").reduce((s, i) => s + (i.est_cost || 0), 0));
+  /* 本周家长审核报废的食材损失（按批次实际单价），计入本周预算占用 */
+  const waste = Array.isArray(state.scraps) ? batchesMod.wastageSummary(state) : { cost: 0, grams: 0, count: 0 };
   const projected = round2(spent + committed);
   return {
     budget: round2(budget),
     spent,                       // 已实际采购支出
     price_delta: round2(spent - estSpent), // 实际价与预估偏差
-    committed,                   // 待买预估占用
-    projected,                   // 预计本周总支出
+    committed,                   // 待买预估占用（含报废后自动补入的替换采购）
+    projected,                   // 预计本周采购总支出
     remaining: round2(budget - projected),
     over: projected > budget,
+    wastage_cost: waste.cost,    // 本周报废损失（食材成本，沉没不计入 projected，单列预警）
+    wastage_grams: waste.grams,
+    wastage_count: waste.count,
   };
 }
 
@@ -194,6 +232,17 @@ function assertFood(foodId) {
   const f = getFood(foodId);
   if (!f) throw new Error("未知食材：" + foodId);
   return f;
+}
+
+/* 角色校验（与分餐协作一致）：actorId 缺省 => 系统 / 脚本调用放行；
+   指定时该成员必须存在，其 role 已分工则必须匹配所需角色（家长 / 采购负责人）。 */
+function assertActorRole(state, actorId, role) {
+  if (actorId == null) return;
+  const actor = state.members.find(m => m.id === Number(actorId));
+  if (!actor) throw new Error("操作人不是家庭成员");
+  if (actor.role && actor.role !== role) {
+    throw new Error(`仅${role === "parent" ? "家长" : role === "buyer" ? "采购负责人" : "成员"}可执行此操作`);
+  }
 }
 
 function assertNoFamilyAllergen(state, food) {
@@ -226,7 +275,8 @@ function buildShoppingList(state, week, opts) {
   const source = opts.source === "family" ? "family" : "menu";
   if (!week || !Array.isArray(week.days)) throw new Error("缺少周菜单");
   const avoid = new Set(familyAllergens(state.members));
-  const on = stockOnHand(state);
+  /* 只有未过期 / 未报废批次才能抵扣净需求：报废后可用库存下降，自动产生替换采购 */
+  const on = usableStock(state);
 
   const need = {};
   for (const day of week.days) {
@@ -330,15 +380,18 @@ function removeItem(state, itemId) {
   const idx = state.shopping.findIndex(x => x.id === itemId && x.cycle === state.cycle_no);
   if (idx < 0) throw new Error("采购任务不存在");
   const [it] = state.shopping.splice(idx, 1);
-  if (it.status === "arrived") {
-    /* 已到货任务被删除：其库存不再可追溯，提示调用方库存可能变化（核算自动重算） */
+  if (it.status === "arrived" && Array.isArray(state.batches)) {
+    /* 已到货任务被删除：同步移除其关联批次（库存核算自动重算），报废记录保留可追溯 */
+    state.batches = state.batches.filter(b => b.shopping_id !== it.id);
   }
   return it;
 }
 
-/* 确认到货：可登记实际克重与实际单价（元/100g），缺省按预估 */
-function arriveItem(state, itemId, opts) {
+/* 确认到货：可登记实际克重与实际单价（元/100g），缺省按预估；
+   同时由采购负责人登记保质期批次（produced_date + shelf_days 或 expire_date，均可空=长期有效）。 */
+function arriveItem(state, itemId, opts, actorId) {
   opts = opts || {};
+  assertActorRole(state, actorId, "buyer");
   const it = state.shopping.find(x => x.id === itemId && x.cycle === state.cycle_no);
   if (!it) throw new Error("采购任务不存在");
   if (it.status !== "pending") throw new Error("该任务已确认到货");
@@ -352,21 +405,48 @@ function arriveItem(state, itemId, opts) {
   it.arrived_grams = grams;
   it.actual_cost = round2((unitCost * grams) / 100);
   if (opts.arrived_by != null) it.arrived_by = Number(opts.arrived_by);
+  /* 登记到货批次（保质期信息缺省时为长期有效批次，可后续在批次台账补登） */
+  if (Array.isArray(state.batches)) {
+    const regBy = actorId != null ? Number(actorId) : (it.arrived_by != null ? it.arrived_by : null);
+    batchesMod.registerBatch(state, {
+      source: "arrive", shopping_id: it.id, food_id: f.id, grams,
+      unit_cost: unitCost,
+      produced_date: opts.produced_date, shelf_days: opts.shelf_days, expire_date: opts.expire_date,
+      note: opts.note || null,
+    }, regBy);
+  }
   return it;
 }
 
 /* ---------------- 消耗 ---------------- */
 
+/* 手动 / 按配餐消耗：按 FEFO（先到期先消耗、临期优先）在可用批次上扣减，
+   不允许消耗已过期 / 已报废批次；每次消耗记录逐批次 allocations，行级可追溯。 */
 function consume(state, input) {
   const f = assertFood(input.food_id);
   const grams = Math.round(Number(input.grams) * 10) / 10;
   if (!(grams > 0)) throw new Error("消耗克重必须为正数");
-  const on = stockOnHand(state);
+  const useBatches = Array.isArray(state.batches);
+  const on = useBatches ? usableStock(state) : stockOnHand(state);
   if ((on[f.id] || 0) + 1e-6 < grams) {
-    const err = new Error(`「${f.name}」库存不足：在库 ${on[f.id] || 0}g，消耗 ${grams}g`);
+    const physical = stockOnHand(state)[f.id] || 0;
+    const unusable = Math.max(0, round1(physical - (on[f.id] || 0)));
+    let msg = `「${f.name}」可用库存不足：可用 ${on[f.id] || 0}g，消耗 ${grams}g`;
+    if (unusable > 0) msg += `（另有 ${unusable}g 已过期 / 报废，请家长先审核处理）`;
+    const err = new Error(msg);
     err.code = "INSUFFICIENT_STOCK";
-    err.deficit = { food_id: f.id, name: f.name, have: on[f.id] || 0, need: grams };
+    err.deficit = { food_id: f.id, name: f.name, have: on[f.id] || 0, physical, need: grams };
     throw err;
+  }
+  let allocations = null;
+  if (useBatches) {
+    const plan = batchesMod.planFefo(state, f.id, grams);
+    if (plan.shortage > 1e-6) {
+      const err = new Error(`「${f.name}」FEFO 分配失败：缺少 ${plan.shortage}g 可用批次`);
+      err.code = "INSUFFICIENT_STOCK";
+      throw err;
+    }
+    allocations = batchesMod.applyConsumptionAllocations(state, plan.allocations);
   }
   const log = {
     id: state.next_log_id++,
@@ -376,6 +456,7 @@ function consume(state, input) {
     source: input.source === "plan" ? "plan" : "manual",
     day_index: Number.isInteger(input.day_index) ? input.day_index : null,
     member: input.member || null,
+    allocations,
   };
   state.consumption.push(log);
   return log;
@@ -411,12 +492,13 @@ function consumeDay(state, dayIndex) {
   const day = plan.days[dayIndex];
   const need = {};
   for (const it of day.items) need[it.food_id] = (need[it.food_id] || 0) + it.grams;
-  const on = stockOnHand(state);
+  const on = usableStock(state);
   const deficits = [];
   for (const [id, g] of Object.entries(need)) {
     if ((on[id] || 0) + 1e-6 < g) {
       const f = getFood(id);
-      deficits.push({ food_id: id, name: f ? f.name : id, have: on[id] || 0, need: g, short: round1(g - (on[id] || 0)) });
+      const physical = stockOnHand(state)[id] || 0;
+      deficits.push({ food_id: id, name: f ? f.name : id, have: on[id] || 0, physical, need: g, short: round1(g - (on[id] || 0)) });
     }
   }
   if (deficits.length) {
@@ -434,11 +516,24 @@ function consumeDay(state, dayIndex) {
   return logs;
 }
 
-/* 期初 / 盘库录入（允许录入含过敏原的存货，但会出现在规避预警中） */
-function setManualStock(state, foodId, grams) {
+/* 期初 / 盘库录入（允许录入含过敏原的存货，但会出现在规避预警中）。
+   批次口径：把该食材的盘库余量重置为 g（替换既有 stocktake 批次，不影响到货批次），
+   允许同时登记保质期；未迁移旧状态仍写 stock_manual 字段。g=0 清除盘库批次。 */
+function setManualStock(state, foodId, grams, opts, actorId) {
   const f = assertFood(foodId);
   const g = Math.round(Number(grams) * 10) / 10;
   if (!(g >= 0)) throw new Error("克重非法");
+  assertActorRole(state, actorId, "buyer");
+  if (Array.isArray(state.batches)) {
+    state.batches = state.batches.filter(b => !(b.source === "stocktake" && b.food_id === f.id));
+    if (g > 0) {
+      batchesMod.registerBatch(state, Object.assign({
+        source: "stocktake", food_id: f.id, grams: g,
+        unit_cost: f.cost, note: "期初 / 盘库录入",
+      }, opts || {}), actorId == null ? null : Number(actorId));
+    }
+    return;
+  }
   if (g === 0) delete state.stock_manual[f.id];
   else state.stock_manual[f.id] = g;
 }
@@ -463,24 +558,79 @@ function weeklyUsed(state) {
   return counts;
 }
 
-/* 后续配餐输入：库存、过敏原并集、本周限次 */
+/* 后续配餐输入：可用库存（自动避开失效批次）、过敏原并集、本周限次 */
 function syncInputs(state) {
-  return { allergens: familyAllergens(state.members), weekly_used: weeklyUsed(state), stock: stockOnHand(state) };
+  return { allergens: familyAllergens(state.members), weekly_used: weeklyUsed(state), stock: usableStock(state) };
+}
+
+/* ---------------- 批次：业务日期 / 家长审核 / 替换采购同步 ---------------- */
+
+/* 设置业务日期（保质期判定基准）与临期阈值；date 传 null 恢复系统当天 */
+function setClock(state, date, nearDays) {
+  batchesMod.setBusinessDate(state, date);
+  if (nearDays != null) batchesMod.setNearDays(state, nearDays);
+  return { today: batchesMod.businessDate(state), near_days: batchesMod.nearDaysOf(state) };
+}
+
+/* 采购负责人对采购渠道外的食材直接登记批次（如邻居赠送 / 市场现买未走采购单），
+   或为已到货但未登记保质期的批次补登（batch_id）。 */
+function registerStockBatch(state, input, actorId) {
+  if (!Array.isArray(state.batches)) throw new Error("批次台账尚未初始化");
+  assertActorRole(state, actorId, "buyer");
+  return batchesMod.registerBatch(state, Object.assign({ source: "stocktake" }, input), actorId == null ? null : Number(actorId));
+}
+
+/* 家长确认临期批次继续使用（不再临期预警；过期仍自动失效） */
+function keepBatch(state, batchId, actorId, note) {
+  assertActorRole(state, actorId, "parent");
+  return batchesMod.acknowledgeNear(state, batchId, actorId, note);
+}
+
+/* 家长审核报废：报废后立即扣减可用库存与库存估值、记本周损失，并自动重算
+   周菜单来源 + 分餐来源采购净需求（报废造成的缺口即替换采购，计入预算占用）。
+   可选 opts.no_resync=true 仅报废不同步（供上层自定义编排）。 */
+function reviewScrapBatch(state, batchId, opts, actorId) {
+  opts = opts || {};
+  assertActorRole(state, actorId, "parent");
+  const result = batchesMod.scrapBatch(state, batchId, opts, actorId);
+  if (!opts.no_resync) resyncShoppingAfterStockChange(state);
+  return result;
+}
+
+/* 库存变化（报废 / 批次登记）后：按当前周菜单与分餐菜单重算净需求，自动补替换采购。
+   family.js 通过 ensureFamilyResync 注入分餐重算函数，避免 require 循环依赖。 */
+let familyResyncHook = null;
+function setFamilyResyncHook(fn) { familyResyncHook = fn; }
+
+function resyncShoppingAfterStockChange(state) {
+  /* 周菜单来源 */
+  if (weekIsCurrent(state) && state.week.plan) {
+    buildShoppingList(state, state.week.plan, { source: "menu" });
+  }
+  /* 分餐来源（仅当前周期菜单） */
+  if (state.family_plan && state.family_plan.cycle === state.cycle_no && typeof familyResyncHook === "function") {
+    familyResyncHook(state);
+  }
 }
 
 /* ---------------- 预警 ---------------- */
 
 function warnings(state, onHand) {
-  const on = onHand || stockOnHand(state);
+  const on = usableStock(state);
+  const physical = onHand || stockOnHand(state);
   const avoid = familyAllergens(state.members);
   const out = [];
 
+  /* 批次保质期预警优先（过期 / 临期待审核 / 本周报废损失） */
+  if (Array.isArray(state.batches)) out.push(...batchesMod.batchWarnings(state));
+
+  /* 过敏原在库预警只看仍可用于配餐的库存（失效批次已在保质期预警中处理） */
   for (const [id, g] of Object.entries(on)) {
     if (g <= 0) continue;
     const f = getFood(id);
     if (!f) continue;
     const hit = (f.allergens || []).filter(a => avoid.includes(a));
-    if (hit.length) out.push({ level: "danger", code: "allergen_stock", text: `库存「${f.name}」含全家规避过敏原 ${hit.join("、")}，请勿用于家庭配餐` });
+    if (hit.length) out.push({ level: "danger", code: "allergen_stock", text: `可用库存「${f.name}」含全家规避过敏原 ${hit.join("、")}，请勿用于家庭配餐` });
   }
   for (const it of currentItems(state)) {
     if (it.status !== "pending") continue;
@@ -495,7 +645,8 @@ function warnings(state, onHand) {
     out.push({ level: "danger", code: "budget_over", text: `本周预计支出 ¥${budget.projected} 超出预算 ¥${budget.budget}，超支 ¥${round2(-budget.remaining)}` });
   }
 
-  /* 缺料预警仅针对本周期菜单；旧周菜单已过期，不再驱动新周期的采购提示 */
+  /* 缺料预警仅针对本周期菜单，按“可用库存（自动避开失效批次）”核算；
+     旧周菜单已过期，不再驱动新周期的采购提示。报废造成的缺口由替换采购补齐。 */
   if (weekIsCurrent(state)) {
     const pendingGrams = {};
     for (const it of currentItems(state)) {
@@ -510,7 +661,8 @@ function warnings(state, onHand) {
       const gap = g - (on[id] || 0) - (pendingGrams[id] || 0);
       if (gap > 1e-6) {
         const f = getFood(id);
-        out.push({ level: "warn", code: "shortage", text: `后续配餐缺料：${f ? f.name : id} 还需 ${roundUp(gap)}g（在库 ${on[id] || 0}g / 待买 ${pendingGrams[id] || 0}g）` });
+        const dead = round1(Math.max(0, (physical[id] || 0) - (on[id] || 0)));
+        out.push({ level: "warn", code: "shortage", text: `后续配餐缺料：${f ? f.name : id} 还需 ${roundUp(gap)}g（可用 ${on[id] || 0}g${dead > 0 ? `，另有 ${dead}g 失效待处理` : ""} / 待买 ${pendingGrams[id] || 0}g）` });
       }
     }
   }
@@ -536,17 +688,24 @@ function decorateItem(state, it) {
 
 function householdView(state) {
   const on = stockOnHand(state);
+  const usable = usableStock(state);
+  const unusable = unusableStock(state);
   const value = inventoryValue(state, on);
   const avoid = new Set(familyAllergens(state.members));
+  const today = batchesMod.businessDate(state);
   const stock = Object.entries(on)
     .filter(([, g]) => g > 0)
     .map(([id, g]) => {
       const f = getFood(id);
+      const usableG = usable[id] || 0;
       return {
         food_id: id, name: f ? f.name : id, cat: f ? f.cat : "", cat_label: f ? f.cat_label || "" : "",
-        grams: g, value: value.per[id] || 0,
+        grams: g, usable_grams: usableG, unusable_grams: round1(g - usableG),
+        value: value.per[id] || 0, unusable_value: (value.unusable_per || {})[id] || 0,
         allergens: f ? [...f.allergens] : [],
         allergen_flag: f ? f.allergens.some(a => avoid.has(a)) : false,
+        expiring_flag: usableG > 0 && (state.batches || []).some(b =>
+          b.food_id === id && ["near", "expired"].includes(batchesMod.batchStatus(b, today, batchesMod.nearDaysOf(state)).key)),
       };
     })
     .sort((a, b) => b.value - a.value || a.food_id.localeCompare(b.food_id));
@@ -554,11 +713,21 @@ function householdView(state) {
   return {
     state,
     family_allergens: familyAllergens(state.members),
+    today,
+    near_days: batchesMod.nearDaysOf(state),
     shopping: currentItems(state)
       .map(it => decorateItem(state, it))
       .sort((a, b) => (a.status === b.status ? a.id - b.id : a.status === "arrived" ? 1 : -1)),
     stock,
     inventory_value: value.total,
+    usable_inventory_value: value.usable_total,
+    unusable_inventory_value: value.unusable_total,
+    batches: Array.isArray(state.batches) ? batchesMod.batchListView(state, today) : [],
+    batch_summary: Array.isArray(state.batches) ? batchesMod.batchSummary(state, today) : null,
+    scraps: Array.isArray(state.scraps) ? state.scraps.filter(r => r.cycle === state.cycle_no)
+      .map(r => ({ ...r, name: getFood(r.food_id) ? getFood(r.food_id).name : r.food_id,
+        by_name: r.by != null ? (state.members.find(m => m.id === r.by) || {}).name || null : null }))
+      .sort((a, b) => b.ts - a.ts) : [],
     budget: budgetSummary(state),
     sync: syncInputs(state),
     warnings: warnings(state, on),
@@ -573,8 +742,11 @@ module.exports = {
   ROUND_G, SAFETY_FACTOR, MEMBER_ROLES,
   emptyHousehold, sanitizeProfile, familyAllergens,
   addMember, updateMember, removeMember,
-  stockOnHand, inventoryValue, budgetSummary,
+  stockOnHand, usableStock, unusableStock, inventoryValue, budgetSummary,
   buildShoppingList, addManualItem, assignItem, removeItem, arriveItem,
   consume, consumeDay, setManualStock, setWeek, startNewCycle,
   weeklyUsed, syncInputs, warnings, householdView, weekIsCurrent,
+  setClock, registerStockBatch, keepBatch, reviewScrapBatch,
+  resyncShoppingAfterStockChange, setFamilyResyncHook,
+  batches: batchesMod,
 };
